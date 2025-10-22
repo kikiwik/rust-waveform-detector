@@ -123,12 +123,12 @@ impl FFTWaveformAnalyzer {
         }
     }
 
-    // ▼▼▼ 修改这里 ▼▼▼
+
     fn perform_fft(&mut self) -> [f32; 128] {
         let fft_result = rfft_256(&mut self.sample_buffer);
-        // ▼▼▼ 修改这里 ▼▼▼
+
         let mut spectrum = [0.0f32; 128];
-        // ▼▼▼ 修改这里 ▼▼▼
+
         for i in 0..128 {
             let val = fft_result[i];
             spectrum[i] = sqrtf(val.re * val.re + val.im * val.im);
@@ -180,14 +180,14 @@ impl FFTWaveformAnalyzer {
         (freq, max_magnitude)
     }
 
-    // ▼▼▼ 修改函数签名这里的类型 ▼▼▼
+
     fn analyze_harmonics(&self, spectrum: &[f32; 128], fundamental: f32) -> [f32; 5] {
         let freq_resolution = self.sample_rate as f32 / 256.0;
         let mut harmonics = [0.0f32; 5];
         for i in 1..=5 {
             let harmonic_freq = fundamental * i as f32;
             let harmonic_bin = (harmonic_freq / freq_resolution).round() as usize;
-            // ▼▼▼ 修改这里的边界检查 ▼▼▼
+            // ▼▼▼ 修改边界检查 ▼▼▼
             if harmonic_bin < 128 {
                 harmonics[i - 1] = spectrum[harmonic_bin];
             }
