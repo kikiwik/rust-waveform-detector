@@ -12,15 +12,37 @@ use esp_idf_svc::hal::gpio::*;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::prelude::*;
 use esp_idf_svc::hal::spi::{self, SpiDeviceDriver, SpiDriverConfig};
+// 定时器相关
+use esp_idf_svc::hal::timer::{TimerDriver, TimerConfig};
+// 同步原语
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // FFT相关
 use libm::sqrtf;
 use microfft::real::rfft_256;
-// --- ADC 相关导入 ---
 use ssd1306::{
     mode::BufferedGraphicsMode, prelude::*, rotation::DisplayRotation, size::DisplaySize128x64,
     Ssd1306,
 };
 use display_interface_spi::SPIInterface;
+
+// === 全局静态变量 ===
+// 双缓冲区
+static mut BUFFER_A: [u16; 256] = [0; 256];
+static mut BUFFER_B: [u16; 256] = [0; 256];
+
+// 当前使用哪个缓冲区进行采样 (false=A, true=B)
+static ACTIVE_BUFFER: AtomicBool = AtomicBool::new(false);
+
+// 当前采样计数
+static SAMPLE_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+// 缓冲区是否已满,可供分析
+static BUFFER_READY: AtomicBool = AtomicBool::new(false);
+
+// ADC全局指针（用于ISR访问）
+use core::ptr::null_mut;
+static mut ADC_DRIVER_PTR: *mut AdcDriver<'static, esp_idf_svc::hal::adc::ADC1> = null_mut();
+static mut ADC_CHANNEL_PTR: *mut AdcChannelDriver<'static, esp_idf_svc::hal::gpio::Gpio1, &'static AdcDriver<'static, esp_idf_svc::hal::adc::ADC1>> = null_mut();
 
 // WaveformType Enum
 #[derive(Clone, Copy, PartialEq)]
@@ -52,7 +74,6 @@ struct WaveformResult {
 // FFTWaveformAnalyzer Struct and impl
 struct FFTWaveformAnalyzer {
     sample_buffer: [f32; 256],
-    sample_count: usize,
     sample_rate: u32,
 }
 
@@ -60,36 +81,19 @@ impl FFTWaveformAnalyzer {
     fn new(sample_rate: u32) -> Self {
         Self {
             sample_buffer: [0.0; 256],
-            sample_count: 0,
             sample_rate,
         }
     }
 
-    fn add_sample(&mut self, adc_value: u16) {
-        if self.sample_count < self.sample_buffer.len() {
+    // 从原始ADC缓冲区加载数据
+    fn load_from_buffer(&mut self, buffer: &[u16; 256]) {
+        for (i, &adc_value) in buffer.iter().enumerate() {
             let voltage = (adc_value as f32 / 4095.0) * 2.5;
-            self.sample_buffer[self.sample_count] = voltage;
-            self.sample_count += 1;
+            self.sample_buffer[i] = voltage;
         }
-    }
-
-    fn reset(&mut self) {
-        self.sample_count = 0;
-    }
-
-    fn is_full(&self) -> bool {
-        self.sample_count >= self.sample_buffer.len()
     }
 
     fn analyze(&mut self) -> WaveformResult {
-        if self.sample_count < 256 {
-            return WaveformResult {
-                waveform_type: WaveformType::Unknown,
-                frequency: 0.0,
-                amplitude: 0.0,
-            };
-        }
-
         let dc_offset = self.remove_dc_offset();
         self.apply_hanning_window();
         let spectrum = self.perform_fft();
@@ -106,9 +110,9 @@ impl FFTWaveformAnalyzer {
     }
 
     fn remove_dc_offset(&mut self) -> f32 {
-        let sum: f32 = self.sample_buffer[..self.sample_count].iter().sum();
-        let dc_offset = sum / self.sample_count as f32;
-        for sample in self.sample_buffer[..self.sample_count].iter_mut() {
+        let sum: f32 = self.sample_buffer.iter().sum();
+        let dc_offset = sum / 256.0;
+        for sample in self.sample_buffer.iter_mut() {
             *sample -= dc_offset;
         }
         dc_offset
@@ -116,17 +120,14 @@ impl FFTWaveformAnalyzer {
 
     fn apply_hanning_window(&mut self) {
         use core::f32::consts::PI;
-        for i in 0..self.sample_count {
-            let window =
-                0.5 * (1.0 - libm::cosf(2.0 * PI * i as f32 / (self.sample_count - 1) as f32));
+        for i in 0..256 {
+            let window = 0.5 * (1.0 - libm::cosf(2.0 * PI * i as f32 / 255.0));
             self.sample_buffer[i] *= window;
         }
     }
 
-
     fn perform_fft(&mut self) -> [f32; 128] {
         let fft_result = rfft_256(&mut self.sample_buffer);
-
         let mut spectrum = [0.0f32; 128];
 
         for i in 0..128 {
@@ -138,19 +139,15 @@ impl FFTWaveformAnalyzer {
 
     fn find_fundamental_frequency(&self, spectrum: &[f32; 128]) -> (f32, f32) {
         let freq_resolution = self.sample_rate as f32 / 256.0;
+        let last_index = spectrum.len() - 1;
 
-        // --- 1. 使用 spectrum.len() 来确定边界 ---
-        let last_index = spectrum.len() - 1; // 数组的最后一个有效索引 (128)
-
-        let min_bin = (20000.0 / freq_resolution).round() as usize;
-        let max_bin = (100000.0 / freq_resolution).round() as usize;
-
-        // 搜索范围不能超过数组的最后一个索引
+        let min_bin = (100.0 / freq_resolution).round() as usize;  // 降低最小频率到100Hz
+        let max_bin = (20000.0 / freq_resolution).round() as usize; // 最大20kHz
         let search_end = max_bin.min(last_index);
 
         let mut max_magnitude = 0.0;
         let mut max_bin_index = min_bin;
-        // 确保 min_bin 不会一开始就越界
+        
         for i in min_bin..=search_end {
             if spectrum[i] > max_magnitude {
                 max_magnitude = spectrum[i];
@@ -158,14 +155,11 @@ impl FFTWaveformAnalyzer {
             }
         }
 
-        // --- 2. 使用一个更清晰的条件来进行插值计算 ---
-        // 条件：峰值索引必须大于0且小于最后一个索引，这样才能安全地访问-1和+1
         let freq = if max_bin_index > 0 && max_bin_index < last_index {
             let alpha = spectrum[max_bin_index - 1];
             let beta = spectrum[max_bin_index];
             let gamma = spectrum[max_bin_index + 1];
 
-            // 避免除以零
             if (alpha - 2.0 * beta + gamma).abs() < 1e-6 {
                 max_bin_index as f32 * freq_resolution
             } else {
@@ -173,25 +167,24 @@ impl FFTWaveformAnalyzer {
                 (max_bin_index as f32 + delta) * freq_resolution
             }
         } else {
-            // 如果峰值在数组的边界上（第一个或最后一个），则不进行插值
             max_bin_index as f32 * freq_resolution
         };
 
         (freq, max_magnitude)
     }
 
-
     fn analyze_harmonics(&self, spectrum: &[f32; 128], fundamental: f32) -> [f32; 5] {
         let freq_resolution = self.sample_rate as f32 / 256.0;
         let mut harmonics = [0.0f32; 5];
+        
         for i in 1..=5 {
             let harmonic_freq = fundamental * i as f32;
             let harmonic_bin = (harmonic_freq / freq_resolution).round() as usize;
-            // ▼▼▼ 修改边界检查 ▼▼▼
             if harmonic_bin < 128 {
                 harmonics[i - 1] = spectrum[harmonic_bin];
             }
         }
+        
         let fundamental_magnitude = harmonics[0];
         if fundamental_magnitude > 1e-6 {
             for h in harmonics.iter_mut() {
@@ -207,14 +200,12 @@ impl FFTWaveformAnalyzer {
         let h3 = harmonics[2];
         let h5 = harmonics[4];
         let thd = sqrtf(h2 * h2 + h3 * h3 + h5 * h5);
+        
         log::info!(
             "Harmonics: 1={:.3}, 2={:.3}, 3={:.3}, 5={:.3}, THD={:.3}",
-            h1,
-            h2,
-            h3,
-            h5,
-            thd
+            h1, h2, h3, h5, thd
         );
+        
         if thd < 0.1 {
             WaveformType::Sine
         } else if h3 > 0.15 && h5 > 0.05 {
@@ -233,24 +224,30 @@ impl FFTWaveformAnalyzer {
     fn calculate_amplitude(&self, dc_offset: f32) -> f32 {
         let mut max_val = -f32::MAX;
         let mut min_val = f32::MAX;
-        for i in 0..self.sample_count {
-            let val = self.sample_buffer[i] + dc_offset;
-            if val > max_val {
-                max_val = val;
+        
+        for &val in self.sample_buffer.iter() {
+            let actual_val = val + dc_offset;
+            if actual_val > max_val {
+                max_val = actual_val;
             }
-            if val < min_val {
-                min_val = val;
+            if actual_val < min_val {
+                min_val = actual_val;
             }
         }
+        
         let vpp = max_val - min_val;
-        if min_val < 0.1 { vpp * 2.0 } else { vpp }
+        if min_val < 0.1 { 
+            vpp * 2.0 
+        } else { 
+            vpp 
+        }
     }
 }
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    log::info!("ESP32-S3 FFT Wave Detector Starting...");
+    log::info!("ESP32-S3 FFT Wave Detector Starting (Timer ISR Mode)...");
 
     let peripherals = Peripherals::take().unwrap();
 
@@ -298,34 +295,82 @@ fn main() -> Result<()> {
     // --- ADC Init ---
     log::info!("Initializing ADC...");
     let adc = AdcDriver::new(peripherals.adc1)?;
-
-    // 使用默认配置
+    
+    // 将ADC驱动转换为裸指针
+    let adc_ptr = Box::into_raw(Box::new(adc));
+    
+    // 创建ADC通道时需要引用ADC驱动
     let adc_config = AdcChannelConfig::default();
-    let mut adc_channel = AdcChannelDriver::new(&adc, peripherals.pins.gpio1, &adc_config)?;
+    let adc_channel = unsafe {
+        AdcChannelDriver::new(&*adc_ptr, peripherals.pins.gpio1, &adc_config)?
+    };
+    
+    // 存储指针供ISR使用
+    unsafe {
+        ADC_DRIVER_PTR = adc_ptr;
+        ADC_CHANNEL_PTR = Box::into_raw(Box::new(adc_channel));
+    }
 
     log::info!("ADC initialized on GPIO1!");
 
-    let sample_rate = 256_000;
+    // --- 定时器设置 ---
+    let sample_rate = 40_000u32; // 40 kHz采样率
+    let timer_config = TimerConfig::new();
+    let mut timer = TimerDriver::new(peripherals.timer00, &timer_config)?;
+    
+    // 设置定时器周期 (单位: 微秒)
+    // 40kHz = 25us per sample
+    let timer_period_us = 1_000_000u64 / sample_rate as u64;
+    
+    timer.set_alarm(timer_period_us)?;
+    timer.enable_alarm(true)?;
+    timer.enable_interrupt()?;
+    
+    // 订阅定时器中断
+    unsafe {
+        timer.subscribe(timer_isr_callback)?;
+    }
+    
+    timer.enable(true)?;
+    
+    log::info!("Timer initialized! Sample rate: {} Hz (period: {} us)", 
+               sample_rate, timer_period_us);
+
     let mut analyzer = FFTWaveformAnalyzer::new(sample_rate);
     let text_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
 
     log::info!("Starting FFT analysis loop...");
-    log::info!("Sample rate: {} Hz, FFT size: 256", sample_rate);
 
     // --- Main Loop ---
     loop {
-        analyzer.reset();
-        let sample_interval_us = 1_000_000 / sample_rate;
-
-        while !analyzer.is_full() {
-            match adc.read(&mut adc_channel) {
-                Ok(value) => analyzer.add_sample(value),
-                Err(e) => log::error!("ADC read error: {:?}", e),
-            }
-            unsafe { esp_idf_svc::sys::esp_rom_delay_us(sample_interval_us) };
+        // 等待缓冲区准备好
+        while !BUFFER_READY.load(Ordering::Acquire) {
+            FreeRtos::delay_ms(1);
         }
+        
+        // 读取完整的缓冲区
+        // 双缓冲机制确保了ISR写活动缓冲区时，主线程读非活动缓冲区
+        // 原子操作保证了标志位的正确切换，无需额外的临界区保护
+        let buffer_to_analyze: [u16; 256];
+        unsafe {
+            // 读取非活动缓冲区(已填充完成的那个)
+            if ACTIVE_BUFFER.load(Ordering::Acquire) {
+                // 当前在用B,读取A
+                buffer_to_analyze = BUFFER_A;
+            } else {
+                // 当前在用A,读取B
+                buffer_to_analyze = BUFFER_B;
+            }
+        }
+        
+        // 重置ready标志，允许下一次采样
+        BUFFER_READY.store(false, Ordering::Release);
 
+        // 分析数据
+        analyzer.load_from_buffer(&buffer_to_analyze);
         let result = analyzer.analyze();
+        
+        // 更新显示
         display.clear(BinaryColor::Off).unwrap();
 
         let mut line0 = heapless::String::<32>::new();
@@ -360,8 +405,43 @@ fn main() -> Result<()> {
             result.frequency,
             result.amplitude
         );
+    }
+}
 
-        FreeRtos::delay_ms(300);
+// === 定时器中断服务程序 ===
+fn timer_isr_callback() {
+    unsafe {
+        // 检查指针是否有效
+        if ADC_DRIVER_PTR.is_null() || ADC_CHANNEL_PTR.is_null() {
+            return;
+        }
+        
+        // 通过裸指针访问ADC（避免借用检查问题）
+        let adc_driver = &*ADC_DRIVER_PTR;
+        let adc_channel = &mut *ADC_CHANNEL_PTR;
+        
+        if let Ok(value) = adc_driver.read(adc_channel) {
+            let idx = SAMPLE_INDEX.load(Ordering::Relaxed);
+            
+            if idx < 256 {
+                // 写入当前活动缓冲区
+                if ACTIVE_BUFFER.load(Ordering::Relaxed) {
+                    BUFFER_B[idx] = value;
+                } else {
+                    BUFFER_A[idx] = value;
+                }
+                
+                SAMPLE_INDEX.store(idx + 1, Ordering::Relaxed);
+                
+                // 缓冲区满了
+                if idx + 1 >= 256 {
+                    // 切换缓冲区
+                    ACTIVE_BUFFER.fetch_xor(true, Ordering::Release);
+                    SAMPLE_INDEX.store(0, Ordering::Relaxed);
+                    BUFFER_READY.store(true, Ordering::Release);
+                }
+            }
+        }
     }
 }
 
